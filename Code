@@ -1,0 +1,154 @@
+import numpy as np
+import pandas as pd
+from backtesting import Backtest, Strategy
+
+def mean(x):
+    return np.mean(x)
+
+def std_dev(x):
+    return np.std(x, ddof=1)
+
+def ts_mean(arr, window, idx):
+    if idx - window + 1 < 0:
+        return np.nan
+    return mean(arr[idx - window + 1 : idx + 1])
+
+def ts_std_dev(arr, window, idx):
+    if idx - window + 1 < 0:
+        return np.nan
+    return std_dev(arr[idx - window + 1 : idx + 1])
+
+def ts_sum(condition_arr, window, idx):
+    if idx - window + 1 < 0:
+        return np.nan
+    return np.sum(condition_arr[idx - window + 1 : idx + 1])
+
+def ts_decay_linear(signal_arr, window, idx):
+    if idx - window + 1 < 0:
+        return np.nan
+    weights = np.arange(1, window + 1)
+    window_vals = signal_arr[idx - window + 1 : idx + 1]
+    return np.dot(window_vals, weights) / weights.sum()
+
+def ts_zscore(arr, window, idx):
+    if idx - window + 1 < 0:
+        return np.nan
+    window_vals = arr[idx - window + 1 : idx + 1]
+    m = mean(window_vals)
+    s = std_dev(window_vals)
+    if s == 0:
+        return 0
+    return (arr[idx] - m) / s
+
+def group_neutralize(signal_arr, market_arr, idx, window):
+    # Neutralize signal by removing correlation with market via linear regression residuals over the window
+    if idx - window + 1 < 0:
+        return np.nan
+    y = signal_arr[idx - window + 1 : idx + 1]
+    x = market_arr[idx - window + 1 : idx + 1]
+    x_mean = mean(x)
+    y_mean = mean(y)
+    cov = np.mean((x - x_mean) * (y - y_mean))
+    var = np.mean((x - x_mean) ** 2)
+    if var == 0:
+        return signal_arr[idx]
+    beta = cov / var
+    residual = signal_arr[idx] - beta * market_arr[idx]
+    return residual
+
+class MyStrategy(Strategy):
+    window = 15
+    decay_window = 20
+    zscore_window = 250
+    stddev_mult = 1
+    buy_threshold = 5
+    sell_threshold = -3.5
+
+    def init(self):
+        self.close = np.array(self.data.Close)
+        self.high = np.array(self.data.High)
+        self.low = np.array(self.data.Low)
+        self.open = np.array(self.data.Open)
+        self.market = self.close  # proxy for market in neutralize
+        
+        self.signal_arr = np.full(len(self.close), np.nan)
+
+    def next(self):
+        i = len(self.data.Close) - 1
+
+        if i < self.window - 1:
+            return
+
+        # Step 1: average price
+        average = (self.high[i] + self.low[i] + self.close[i] + self.open[i]) / 4
+
+        # For convenience, calculate average array up to i:
+        # (to avoid recomputing every bar, you could precompute in init)
+        # But for simplicity, calculate on the fly here for i:
+        # Let's store average for all bars so far
+        if not hasattr(self, 'avg_arr'):
+            self.avg_arr = np.full(len(self.close), np.nan)
+        self.avg_arr[i] = average
+
+        # Skip until avg_arr has enough data
+        if i < self.window - 1:
+            return
+
+        # Calculate MA and std dev on avg_arr
+        MA = ts_mean(self.avg_arr, self.window, i)
+        std = ts_std_dev(self.avg_arr, self.window, i)
+
+        if np.isnan(MA) or np.isnan(std):
+            return
+
+        BOLU = MA + self.stddev_mult * std
+        BOLD = MA - self.stddev_mult * std
+
+        # Calculate condition arrays over window for signal
+        # Create bool arrays for close < BOLD and close > BOLU over last window
+        cond_lower = self.close[i - self.window + 1 : i + 1] < BOLD
+        cond_upper = self.close[i - self.window + 1 : i + 1] > BOLU
+
+        # Signal calculation
+        signal_raw = np.sum(cond_lower) - np.sum(cond_upper)
+
+        # Save signal_raw for decay
+        if not hasattr(self, 'signal_raw_arr'):
+            self.signal_raw_arr = np.full(len(self.close), np.nan)
+        self.signal_raw_arr[i] = signal_raw
+
+        # Apply decay linear to signal_raw over decay_window
+        if i >= self.window + self.decay_window - 2:
+            decay_val = ts_decay_linear(self.signal_raw_arr, self.decay_window, i)
+        else:
+            return  # wait for enough data
+
+        # Neutralize decay_val with market over zscore_window
+        if i >= self.window + self.decay_window + self.zscore_window - 3:
+            neutralized_val = group_neutralize(self.signal_raw_arr, self.market, i, self.zscore_window)
+        else:
+            return  # wait for enough data
+
+        # Zscore normalize neutralized_val over zscore_window
+        if i >= self.window + self.decay_window + self.zscore_window - 2:
+            zscore_val = ts_zscore(self.signal_raw_arr, self.zscore_window, i)
+        else:
+            return
+
+        # Trading logic: buy if zscore_val > 1, sell if zscore_val < -1
+        price = self.close[i]
+        size = int(self.equity * 0.2 / price)
+
+        if not self.position and zscore_val > 1:
+            self.buy(size=size)
+        elif self.position.is_long and zscore_val < -1:
+            self.position.close()
+
+data = pd.read_csv('C:/Users/Gautam Modi/Downloads/nse500.csv', parse_dates=['Date'], dayfirst=True)
+data.set_index('Date', inplace=True)
+data.sort_index(inplace=True)
+
+bt = Backtest(data, MyStrategy, cash = 1000000)
+stats = bt.run()
+print(stats)
+bt.plot()
